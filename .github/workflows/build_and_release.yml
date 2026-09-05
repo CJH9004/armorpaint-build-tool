@@ -1,0 +1,446 @@
+# =============================================================================
+# ArmorPaint 自动构建与发布工作流
+#
+# 触发方式：仅手动（workflow_dispatch）。
+#   - 指定版本与平台构建单个组合；
+#   - 勾选 build_all 时自动补齐所有缺失的「版本×平台」组合。
+#
+# 版本范围：仅构建 26.09 及之后的版本（CalVer 年.月 格式）。
+#   原因：26.09 起 ArmorPaint 重写为纯 C（iron 引擎），仓库自带 base/make
+#   构建系统（预编译 amake 工具），仅凭 CI runner 自带编译器即可构建；
+#   更早的 tag（23.09 及以前）为 Haxe/armorcore 架构，构建体系完全不同，
+#   无法用当前流程构建。工作流通过检测 tag 中 paint/project.js 是否包含
+#   add_cfiles 来判定版本是否可构建，未来官方发布的新版本自动适配。
+#
+# 构建方式：与 ArmorPaint 官方仓库的 CI 保持一致：
+#   cd paint && ../base/make --compile
+#   （Windows 为 ClangCL / MSBuild，Linux 为 clang + Makefile，macOS 为
+#   Xcode；均为 Release 配置）
+#
+# 产物布局：
+#   - Windows/Linux：paint/build/out/（ArmorPaint(.exe) + data/ 资源目录，
+#     程序按可执行文件所在目录加载 data）；
+#   - macOS：自包含的 ArmorPaint.app（资源由 Xcode Resources 阶段复制进
+#     Contents/Resources/out/）。
+#
+# 发布策略（并发安全）：
+#   - 目标 Release 为 Draft（草稿，仅仓库所有者可见）。ArmorPaint 源码虽为
+#     zlib 许可，但官方以付费形式分发构建产物以支持项目开发，为尊重其资助
+#     模式，本仓库产物仅以草稿形式发布，请勿公开分发；
+#   - 已存在的草稿不会被删除，产物以 --clobber 方式覆盖上传（始终为最新
+#     构建），因此同一版本的三个平台任务可以安全并发；
+#   - 仅当同名 Release 已被发布为正式版（非草稿）时，先删除再重建为草稿。
+# =============================================================================
+
+name: Build and Release ArmorPaint
+
+on:
+  # 手动触发
+  workflow_dispatch:
+    inputs:
+      armorpaint_version:
+        description: 'ArmorPaint 版本 tag（仅 26.09+，如 26.09；留空构建最新版）'
+        required: false
+        default: ''
+        type: string
+      platform:
+        description: '构建平台'
+        required: false
+        type: choice
+        default: 'windows-latest'
+        options:
+          - windows-latest
+          - macos-latest
+          - ubuntu-latest
+      build_all:
+        description: '补齐全部缺失的版本×平台组合'
+        required: false
+        default: false
+        type: boolean
+
+# 同一事件类型的运行排队执行，不取消进行中的运行
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  # 只构建此版本及之后的稳定版（26.09 起为纯 C 构建系统，旧 tag 无法构建）
+  MIN_VERSION: 26.09
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1：计算要构建的「版本×平台」组合（手动触发时运行）
+  #  - 手动单发（未勾选 build_all）：单个组合，版本取输入（空则由构建步骤
+  #    解析为最新可构建版本），平台取输入；
+  #  - 勾选 build_all：对比 armory3d/armorpaint 官方 tags 与本仓库已有
+  #    releases（含 draft），输出全部缺失组合。
+  # 输出 JSON 数组：[ {"version":"26.09","platform":"windows-latest"}, ... ]
+  # ---------------------------------------------------------------------------
+  check-and-trigger:
+    runs-on: ubuntu-latest
+    if: ${{ always() }}
+    outputs:
+      combos: ${{ steps.check.outputs.combos }}
+    steps:
+      - name: 计算构建组合
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT: ${{ github.event_name }}
+          BUILD_ALL: ${{ inputs.build_all }}
+          INPUT_VERSION: ${{ inputs.armorpaint_version }}
+          INPUT_PLATFORM: ${{ inputs.platform }}
+        run: |
+          set -euo pipefail
+
+          # ---- 仅处理 workflow_dispatch 事件 ----
+          if [ "$EVENT" != "workflow_dispatch" ]; then
+            echo "事件 ${EVENT} 不触发构建"
+            echo "combos=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # ---- 0. 手动单发模式：直接输出输入的组合 ----
+          if [ "$EVENT" = "workflow_dispatch" ] && [ "$BUILD_ALL" != "true" ]; then
+            echo "手动单发模式：version=${INPUT_VERSION:-<latest>} platform=${INPUT_PLATFORM}"
+            combos="[{\"version\":\"${INPUT_VERSION}\",\"platform\":\"${INPUT_PLATFORM}\"}]"
+            echo "combos=${combos}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # ---- 1. 获取本仓库全部 releases（含 draft），汇总各 tag 已有产物后缀 ----
+          # 平台产物命名：-windows-x64.zip / -macos-arm64.zip / -linux-x64.tar.gz
+          rel_file="$(mktemp)"
+          page=1
+          while :; do
+            resp=$(curl -sSf \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases?per_page=100&page=${page}")
+            count=$(echo "$resp" | jq -r 'length')
+            if [ "$count" -eq 0 ]; then break; fi
+            echo "$resp" | jq -c '.[] | {tag: .tag_name, assets: [.assets[].name]}' >> "$rel_file"
+            page=$((page + 1))
+          done
+
+          has_asset() {  # has_asset <tag> <suffix>
+            grep -F "\"tag\":\"$1\"" "$rel_file" 2>/dev/null \
+              | jq -r --arg s "$2" '.assets[]? | select(endswith($s))' 2>/dev/null | grep -q .
+          }
+
+          # ---- 2. 获取 armory3d/armorpaint 官方 tags（分页拉取）----
+          official_tags_file="$(mktemp)"
+          page=1
+          while :; do
+            resp=$(curl -sSf \
+              "https://api.github.com/repos/armory3d/armorpaint/tags?per_page=100&page=${page}")
+            count=$(echo "$resp" | jq -r 'length')
+            if [ "$count" -eq 0 ]; then break; fi
+            echo "$resp" | jq -r '.[].name' >> "$official_tags_file"
+            page=$((page + 1))
+            if [ "$page" -gt 10 ]; then break; fi   # 安全上限
+          done
+
+          # ---- 3. 过滤：仅保留 YY.MM 格式且 >= MIN_VERSION 的稳定 tag ----
+          # （旧版本为 Haxe/armorcore 架构，无法用当前流程构建，详见 README）
+          stable_file="$(mktemp)"
+          grep -E '^[0-9]{2}\.[0-9]{2}$' "$official_tags_file" | while read -r tag; do
+            if [ "$(printf '%s\n%s\n' "${MIN_VERSION}" "$tag" | sort -V | head -n 1)" = "${MIN_VERSION}" ]; then
+              echo "$tag"
+            fi
+          done | sort -rV > "$stable_file" || true
+          echo "目标范围内的官方版本（>= ${MIN_VERSION}）："
+          cat "$stable_file" || true
+          echo "本仓库已有 releases："
+          cat "$rel_file" || true
+
+          # ---- 4. 按「版本×平台」计算缺失组合 ----
+          # 额外校验版本的构建能力：纯 C 架构的 paint/project.js 含 add_cfiles
+          combos_json="["
+          first=1
+          while read -r tag; do
+            [ -z "$tag" ] && continue
+            proj=$(curl -sSf "https://raw.githubusercontent.com/armory3d/armorpaint/${tag}/paint/project.js" 2>/dev/null || true)
+            if ! echo "$proj" | grep -q "add_cfiles"; then
+              echo "跳过：${tag}（非纯 C 构建系统，无法用当前流程构建）"
+              continue
+            fi
+            for plat in windows-latest macos-latest ubuntu-latest; do
+              case "$plat" in
+                windows-latest) suffix="-windows-x64.zip" ;;
+                macos-latest)   suffix="-macos-arm64.zip" ;;
+                ubuntu-latest)  suffix="-linux-x64.tar.gz" ;;
+              esac
+              if ! has_asset "$tag" "$suffix"; then
+                echo "缺失：${tag} × ${plat}"
+                if [ $first -eq 1 ]; then first=0; else combos_json="${combos_json},"; fi
+                combos_json="${combos_json}{\"version\":\"${tag}\",\"platform\":\"${plat}\"}"
+              fi
+            done
+          done < "$stable_file"
+          combos_json="${combos_json}]"
+
+          echo "combos=${combos_json}" >> "$GITHUB_OUTPUT"
+          echo "最终输出：${combos_json}"
+
+  # ---------------------------------------------------------------------------
+  # Job 2：构建矩阵
+  #  - 手动单发（未勾选 build_all）：单个「版本×平台」组合；
+  #  - 勾选 build_all：全部缺失的「版本×平台」组合。
+  # ---------------------------------------------------------------------------
+  build:
+    needs: check-and-trigger
+    if: >-
+      always() &&
+      needs.check-and-trigger.result == 'success' &&
+      needs.check-and-trigger.outputs.combos != '' &&
+      needs.check-and-trigger.outputs.combos != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.check-and-trigger.outputs.combos) }}
+    runs-on: ${{ matrix.platform }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: 解析要构建的版本号
+        id: resolve
+        env:
+          INPUT_VERSION: ${{ matrix.version }}
+          MIN_VERSION: ${{ env.MIN_VERSION }}
+        run: |
+          set -euo pipefail
+
+          # 校验版本格式与构建能力（纯 C 架构的 paint/project.js 含 add_cfiles）
+          validate_version() {
+            local ver="$1"
+            if ! echo "$ver" | grep -Eq '^[0-9]{2}\.[0-9]{2}$'; then
+              echo "不支持的版本格式：${ver}（仅支持 YY.MM 格式的稳定版本，如 26.09）"
+              exit 1
+            fi
+            if [ "$(printf '%s\n%s\n' "${MIN_VERSION}" "$ver" | sort -V | head -n 1)" != "${MIN_VERSION}" ]; then
+              echo "不支持的版本：${ver}（本仓库仅构建 ${MIN_VERSION} 及以上版本，原因见 README）"
+              exit 1
+            fi
+            local proj
+            proj=$(curl -sSf "https://raw.githubusercontent.com/armory3d/armorpaint/${ver}/paint/project.js" 2>/dev/null || true)
+            if ! echo "$proj" | grep -q "add_cfiles"; then
+              echo "不支持的版本：${ver}（该版本为旧 Haxe/armorcore 架构，无法用当前流程构建，原因见 README）"
+              exit 1
+            fi
+          }
+
+          VERSION="${INPUT_VERSION}"
+          # 输入为空或 'latest' 时，取官方 tags 中最新的可构建版本
+          if [ -z "$VERSION" ] || [ "$VERSION" = "latest" ]; then
+            VERSION=$(curl -sSf "https://api.github.com/repos/armory3d/armorpaint/tags?per_page=100" \
+              | jq -r '.[].name' \
+              | grep -E '^[0-9]{2}\.[0-9]{2}$' \
+              | while read -r tag; do
+                  if [ "$(printf '%s\n%s\n' "${MIN_VERSION}" "$tag" | sort -V | head -n 1)" = "${MIN_VERSION}" ]; then
+                    echo "$tag"
+                  fi
+                done \
+              | sort -rV | head -n 1)
+            if [ -z "$VERSION" ]; then
+              echo "未能解析出最新的可构建版本"
+              exit 1
+            fi
+            echo "输入为空/latest，使用官方最新可构建版本：${VERSION}"
+          else
+            validate_version "$VERSION"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "最终构建版本：${VERSION}"
+
+      # -----------------------------------------------------------------
+      # 安装依赖（Windows / macOS runner 自带全部工具链，仅 Linux 需补齐）
+      # -----------------------------------------------------------------
+      - name: 安装依赖
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # 依赖清单来源：armorpaint 官方 CI 与 base/docs/linux_deps.md
+          sudo apt-get install -y --no-install-recommends \
+            make clang libvulkan-dev libgtk-3-dev libssl-dev \
+            libxi-dev libxrandr-dev libxcursor-dev libasound2-dev
+
+      # -----------------------------------------------------------------
+      # 克隆 ArmorPaint 源码（指定 tag，浅克隆；base 构建系统随仓库分发）
+      # -----------------------------------------------------------------
+      - name: 克隆 ArmorPaint 源码
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$VERSION" \
+            https://github.com/armory3d/armorpaint.git
+
+      # -----------------------------------------------------------------
+      # 编译（与官方 CI 一致：cd paint && ../base/make --compile）
+      # Windows 走 pwsh 由 PATHEXT 解析到 base/make.bat（官方 CI 同款写法）；
+      # Linux / macOS 走 base/make（bash 脚本）。
+      # -----------------------------------------------------------------
+      - name: 编译 ArmorPaint
+        if: runner.os != 'Windows'
+        working-directory: armorpaint
+        run: |
+          set -euo pipefail
+          cd paint
+          ../base/make --compile
+
+      - name: 编译 ArmorPaint (Windows)
+        if: runner.os == 'Windows'
+        working-directory: armorpaint
+        shell: pwsh
+        run: |
+          cd paint
+          ../base/make --compile
+
+      # -----------------------------------------------------------------
+      # 打包产物
+      #  - Windows / Linux：paint/build/out/（可执行文件 + data/ 资源）；
+      #  - macOS：paint/build/build/Release/ArmorPaint.app（自包含）。
+      # -----------------------------------------------------------------
+      - name: 打包
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+          RUNNER_PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          STAGING="pkg/staging"
+          mkdir -p "$STAGING"
+
+          case "$RUNNER_PLATFORM" in
+            windows-latest)
+              # 编译脚本会把 exe 复制到 armorpaint/paint/build/out/；做容错
+              # 查找，若未在预期位置则搜索整个 paint/build
+              if [ ! -f "armorpaint/paint/build/out/ArmorPaint.exe" ]; then
+                found=$(find armorpaint/paint/build -name "ArmorPaint.exe" 2>/dev/null | head -n 1 || true)
+                if [ -n "$found" ]; then
+                  echo "ArmorPaint.exe 位于 ${found}，复制到 paint/build/out/"
+                  cp "$found" armorpaint/paint/build/out/ArmorPaint.exe
+                fi
+              fi
+              if [ ! -f "armorpaint/paint/build/out/ArmorPaint.exe" ]; then
+                echo "错误：未找到 ArmorPaint.exe，构建产物不完整"
+                find armorpaint/paint -name "*.exe" 2>/dev/null || true
+                exit 1
+              fi
+              if [ ! -d "armorpaint/paint/build/out/data" ]; then
+                echo "错误：未找到 data 资源目录，构建产物不完整"
+                ls armorpaint/paint/build/out || true
+                exit 1
+              fi
+              cp -r armorpaint/paint/build/out/. "$STAGING/"
+              ARTIFACT="ArmorPaint-${VERSION}-windows-x64.zip"
+              (cd "$STAGING" && 7z a -tzip "../${ARTIFACT}" .)
+              ;;
+            macos-latest)
+              APP=$(find armorpaint/paint/build -maxdepth 5 -type d -name "ArmorPaint.app" 2>/dev/null | head -n 1 || true)
+              if [ -z "$APP" ]; then
+                echo "错误：未找到 ArmorPaint.app"
+                find armorpaint/paint/build -maxdepth 5 -name "*.app" 2>/dev/null || true
+                exit 1
+              fi
+              echo "找到应用包：${APP}"
+              # 自包含校验：资源应已由 Xcode 复制到 Contents/Resources/out/
+              if [ ! -d "${APP}/Contents/Resources/out" ]; then
+                echo "警告：${APP} 内缺少 Contents/Resources/out，资源可能未打包"
+                ls "${APP}/Contents" || true
+              fi
+              ARTIFACT="ArmorPaint-${VERSION}-macos-arm64.zip"
+              ditto -c -k --sequesterRsrc --keepParent "$APP" "pkg/${ARTIFACT}"
+              ;;
+            ubuntu-latest)
+              if [ ! -f "armorpaint/paint/build/out/ArmorPaint" ]; then
+                found=$(find armorpaint/paint/build -type f -name "ArmorPaint" 2>/dev/null | head -n 1 || true)
+                if [ -n "$found" ]; then
+                  echo "ArmorPaint 位于 ${found}，复制到 paint/build/out/"
+                  cp "$found" armorpaint/paint/build/out/ArmorPaint
+                  chmod +x armorpaint/paint/build/out/ArmorPaint
+                fi
+              fi
+              if [ ! -f "armorpaint/paint/build/out/ArmorPaint" ]; then
+                echo "错误：未找到 ArmorPaint 可执行文件，构建产物不完整"
+                find armorpaint/paint/build -maxdepth 5 -type f -perm -u+x 2>/dev/null | head -20 || true
+                exit 1
+              fi
+              if [ ! -d "armorpaint/paint/build/out/data" ]; then
+                echo "错误：未找到 data 资源目录，构建产物不完整"
+                ls armorpaint/paint/build/out || true
+                exit 1
+              fi
+              cp -r armorpaint/paint/build/out/. "$STAGING/"
+              ARTIFACT="ArmorPaint-${VERSION}-linux-x64.tar.gz"
+              tar -czf "pkg/${ARTIFACT}" -C "$STAGING" .
+              ;;
+            *)
+              echo "未知平台：${RUNNER_PLATFORM}"
+              exit 1
+              ;;
+          esac
+          echo "产物：${ARTIFACT}"
+          echo "artifact_name=${ARTIFACT}" >> "$GITHUB_ENV"
+
+      - name: 上传构建产物（Artifact 备份）
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.artifact_name }}
+          path: pkg/${{ env.artifact_name }}
+          if-no-files-found: error
+
+      # -----------------------------------------------------------------
+      # 发布 Draft Release（并发安全）
+      #  - 已存在的草稿不删除，产物用 --clobber 覆盖上传（始终为最新构建）；
+      #  - 同一版本的三个平台任务并发运行时互不干扰；
+      #  - 仅当同名 Release 已被发布为正式版时，先删除（含 tag）再重建为草稿。
+      # -----------------------------------------------------------------
+      - name: 发布 Draft Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+          ARTIFACT: ${{ env.artifact_name }}
+        run: |
+          set -euo pipefail
+          # 若同名 release 已存在且为正式发布（非草稿），先删除再重建为草稿
+          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" --json isDraft >/dev/null 2>&1; then
+            is_draft=$(gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" --json isDraft -q .isDraft)
+            if [ "$is_draft" != "true" ]; then
+              echo "已存在正式 release：${VERSION}，删除后重建为草稿"
+              gh release delete "$VERSION" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || {
+                echo "gh release delete 失败，尝试手动删除 tag"
+                git push --delete "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$VERSION" || true
+              }
+            fi
+          fi
+          # 若草稿不存在则创建（并发下可能已被兄弟任务创建，失败可容忍）
+          if ! gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$VERSION" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "ArmorPaint ${VERSION} (Auto Build)" \
+              --draft \
+              --notes "自动构建于 $(date -u)" \
+              || echo "release ${VERSION} 创建失败（可能已被并行任务创建），继续上传"
+          fi
+          # 等待 release 可见（API 最终一致性）
+          for i in $(seq 1 12); do
+            gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 && break
+            sleep 5
+          done
+          # 上传产物（--clobber 覆盖同名旧产物；带重试，缓解瞬时 403/限流）
+          for attempt in 1 2 3; do
+            if gh release upload "$VERSION" "pkg/${ARTIFACT}" \
+                 --repo "$GITHUB_REPOSITORY" --clobber; then
+              echo "已上传产物到 Draft Release：${VERSION}（${ARTIFACT}）"
+              exit 0
+            fi
+            echo "上传失败（第 ${attempt} 次），10 秒后重试"
+            sleep 10
+          done
+          echo "产物上传最终失败：${ARTIFACT}"
+          exit 1
